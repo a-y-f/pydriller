@@ -154,14 +154,22 @@ class ModifiedFile:
 
     def __init__(
             self,
-            diff: Diff,
+            old_path: Optional[str],
+            new_path: Optional[str],
+            change_type: ModificationType,
+            diff_and_content: Dict[str, Any],
     ):
         """
         Initialize a modified file. A modified file carries on information
         regarding the changed file. Normally, you shouldn't initialize a new
         one.
         """
-        self._c_diff = diff
+        self._old_path = Path(old_path) if old_path is not None else None
+        self._new_path = Path(new_path) if new_path is not None else None
+        self.change_type = change_type
+        self.diff: str = diff_and_content["diff"]
+        self.content: Optional[bytes] = diff_and_content["content"]
+        self.content_before: Optional[bytes] = diff_and_content["content_before"]
 
         self._nloc = None
         self._complexity = None
@@ -180,58 +188,15 @@ class ModifiedFile:
         return hash(hashlib.sha256(string.encode("utf-8")).hexdigest())
 
     @property
-    def change_type(self) -> ModificationType:
-        return self._from_change_to_modification_type(self._c_diff)
-
-    @staticmethod
-    def _from_change_to_modification_type(diff: Diff) -> ModificationType:
-        if diff.new_file:
-            return ModificationType.ADD
-        if diff.deleted_file:
-            return ModificationType.DELETE
-        if diff.renamed_file:
-            return ModificationType.RENAME
-        if diff.a_blob and diff.b_blob and diff.a_blob != diff.b_blob:
-            return ModificationType.MODIFY
-
-        return ModificationType.UNKNOWN
-
-    @property
-    def diff(self) -> str:
-        return self._get_decoded_str(self._c_diff.diff) or ''
-
-    def _get_decoded_str(self, diff: Union[str, bytes, None]) -> Optional[str]:
-        try:
-            if isinstance(diff, bytes):
-                return diff.decode("utf-8", "ignore")
-            if isinstance(diff, str):
-                return diff
-            return None
-        except (AttributeError, ValueError):
-            logger.debug(f"Could not load the diff of file {self.filename}")
-            return None
-
-    @property
-    def content(self) -> Optional[bytes]:
-        return self._get_undecoded_content(self._c_diff.b_blob)
-
-    @property
-    def content_before(self) -> Optional[bytes]:
-        return self._get_undecoded_content(self._c_diff.a_blob)
-
-    def _get_undecoded_content(self, blob: Optional[IndexObject]) -> Optional[bytes]:
-        return blob.data_stream.read() if blob is not None else None
-
-    @property
     def source_code(self) -> Optional[str]:
-        if self.content and isinstance(self.content, bytes):
+        if self.content and type(self.content) == bytes:
             return self._get_decoded_content(self.content)
 
         return None
 
     @property
     def source_code_before(self) -> Optional[str]:
-        if self.content_before and isinstance(self.content_before, bytes):
+        if self.content_before and type(self.content_before) == bytes:
             return self._get_decoded_content(self.content_before)
 
         return None
@@ -269,8 +234,8 @@ class ModifiedFile:
 
         :return: str old_path
         """
-        if self._c_diff.a_path:
-            return str(Path(self._c_diff.a_path))
+        if self._old_path is not None:
+            return str(self._old_path)
         return None
 
     @property
@@ -280,8 +245,8 @@ class ModifiedFile:
 
         :return: str new_path
         """
-        if self._c_diff.b_path:
-            return str(Path(self._c_diff.b_path))
+        if self._new_path is not None:
+            return str(self._new_path)
         return None
 
     @property
@@ -293,13 +258,13 @@ class ModifiedFile:
 
         :return: str filename
         """
-        if self.new_path is not None and self.new_path != "/dev/null":
-            path = self.new_path
+        if self._new_path is not None and str(self._new_path) != "/dev/null":
+            path = self._new_path
         else:
-            assert self.old_path
-            path = self.old_path
+            assert self._old_path
+            path = self._old_path
 
-        return Path(path).name
+        return path.name
 
     @property
     def language_supported(self) -> bool:
@@ -707,6 +672,12 @@ class Commit:
         """
         return self._c_object.stats.total["files"]
 
+    def compare(self, compare_commit) -> List[ModifiedFile]:
+        diff_index: Any = compare_commit._c_object.diff(
+            other=self._c_object, paths=None, create_patch=True
+        )
+        return self._parse_diff(diff_index)
+
     @property
     def modified_files(self) -> List[ModifiedFile]:
         """
@@ -753,11 +724,38 @@ class Commit:
     def _parse_diff(self, diff_index: List[Diff]) -> List[ModifiedFile]:
         modified_files_list = []
         for diff in diff_index:
+            old_path = diff.a_path
+            new_path = diff.b_path
+            change_type = self._from_change_to_modification_type(diff)
+
+            diff_and_content = {
+                "diff": self._get_decoded_str(diff.diff),
+                "content_before": self._get_undecoded_content(diff.a_blob),
+                "content": self._get_undecoded_content(diff.b_blob),
+            }
+
             modified_files_list.append(
-                ModifiedFile(diff=diff)
+                ModifiedFile(old_path, new_path, change_type, diff_and_content)
             )
 
         return modified_files_list
+
+    def _get_decoded_str(self, diff: Union[str, bytes, None]) -> Optional[str]:
+        try:
+            if type(diff) == bytes:
+                return diff.decode("utf-8", "ignore")
+            if type(diff) == str:
+                return diff
+            return None
+        except (AttributeError, ValueError):
+            logger.debug(
+                "Could not load the diff of a " "file in commit %s",
+                self._c_object.hexsha,
+            )
+            return None
+
+    def _get_undecoded_content(self, blob: Optional[IndexObject]) -> Optional[bytes]:
+        return blob.data_stream.read() if blob is not None else None
 
     @property
     def in_main_branch(self) -> bool:
@@ -912,6 +910,19 @@ class Commit:
             assert 0.0 <= proportion <= 1.0
 
         return proportion
+
+    @staticmethod
+    def _from_change_to_modification_type(diff: Diff) -> ModificationType:
+        if diff.new_file:
+            return ModificationType.ADD
+        if diff.deleted_file:
+            return ModificationType.DELETE
+        if diff.renamed_file:
+            return ModificationType.RENAME
+        if diff.a_blob and diff.b_blob and diff.a_blob != diff.b_blob:
+            return ModificationType.MODIFY
+
+        return ModificationType.UNKNOWN
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Commit):
